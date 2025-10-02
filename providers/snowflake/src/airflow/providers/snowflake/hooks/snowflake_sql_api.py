@@ -16,7 +16,10 @@
 # under the License.
 from __future__ import annotations
 
+import asyncio
+import traceback
 import uuid
+import re  # <-- ADDED: Needed for account name cleaning logic
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -36,73 +39,95 @@ class SnowflakeSqlApiHook(SnowflakeHook):
     """
     A client to interact with Snowflake using SQL API and submit multiple SQL statements in a single request.
 
-    In combination with aiohttp, make post request to submit SQL statements for execution,
-    poll to check the status of the execution of a statement. Fetch query results asynchronously.
-
-    This hook requires the snowflake_conn_id connection. This hooks mainly uses account, schema, database,
-    warehouse, and an authentication mechanism from one of below:
-    1. JWT Token generated from private_key_file or private_key_content. Other inputs can be defined in the connection or hook instantiation.
-    2. OAuth Token generated from the refresh_token, client_id and client_secret specified in the connection
-
-    :param snowflake_conn_id: Reference to
-        :ref:`Snowflake connection id<howto/connection:snowflake>`
-    :param account: snowflake account name
-    :param authenticator: authenticator for Snowflake.
-        'snowflake' (default) to use the internal Snowflake authenticator
-        'externalbrowser' to authenticate using your web browser and
-        Okta, ADFS or any other SAML 2.0-compliant identify provider
-        (IdP) that has been defined for your account
-        'https://<your_okta_account_name>.okta.com' to authenticate
-        through native Okta.
-    :param warehouse: name of snowflake warehouse
-    :param database: name of snowflake database
-    :param region: name of snowflake region
-    :param role: name of snowflake role
-    :param schema: name of snowflake schema
-    :param session_parameters: You can set session-level parameters at
-        the time you connect to Snowflake
-    :param token_life_time: lifetime of the JWT Token in timedelta
-    :param token_renewal_delta: Renewal time of the JWT Token in timedelta
-    :param deferrable: Run operator in the deferrable mode.
+    This Hook is optimized for both synchronous (Operator) and asynchronous (Trigger) execution
+    to prevent the AsyncToSync deadlock by ensuring all connection lookups in the async path
+    are run in a separate thread via asyncio.to_thread.
     """
 
-    LIFETIME = timedelta(minutes=59)  # The tokens will have a 59 minute lifetime
-    RENEWAL_DELTA = timedelta(minutes=54)  # Tokens will be renewed after 54 minutes
+    LIFETIME = timedelta(minutes=59)
+    RENEWAL_DELTA = timedelta(minutes=54)
 
     def __init__(
         self,
         snowflake_conn_id: str,
-        token_life_time: timedelta = LIFETIME,
-        token_renewal_delta: timedelta = RENEWAL_DELTA,
+        token_life_time: timedelta | float = LIFETIME,
+        token_renewal_delta: timedelta | float = RENEWAL_DELTA,
         *args: Any,
         **kwargs: Any,
     ):
         self.snowflake_conn_id = snowflake_conn_id
-        self.token_life_time = token_life_time
-        self.token_renewal_delta = token_renewal_delta
+
+        # Defensive type conversion for deserialized floats (from the Trigger)
+        if isinstance(token_life_time, float):
+            self.token_life_time = timedelta(seconds=token_life_time)
+        else:
+            self.token_life_time = token_life_time
+
+        if isinstance(token_renewal_delta, float):
+            self.token_renewal_delta = timedelta(seconds=token_renewal_delta)
+        else:
+            self.token_renewal_delta = token_renewal_delta
+
+        # Call super().__init__ - this is the likely source of synchronous calls
         super().__init__(snowflake_conn_id, *args, **kwargs)
         self.private_key: Any = None
 
     @property
-    def account_identifier(self) -> str:
-        """Returns snowflake account identifier."""
-        conn_config = self._get_conn_params
+    def _get_cleaned_conn_params(self) -> dict[str, Any]:
+        """
+        Retrieves connection parameters and robustly cleans the 'account' field
+        to prevent double domains/paths when reconstructing the full URL.
+        """
+        # This accesses the base hook's logic to retrieve the raw parameters
+        conn_config = self._get_conn_params.copy()
+
+        # NOTE: This property access is synchronous (used by Operator or via asyncio.to_thread).
+
+        account_name = conn_config.get("account")
+        if account_name:
+            # 1. Strip scheme (https://)
+            account_name = re.sub(r"^(https?://)", "", account_name, flags=re.IGNORECASE)
+            # 2. Strip domain (.snowflakecomputing.com) and any paths (e.g., /api/v2/statements)
+            account_name = re.sub(r"(\.snowflakecomputing\.com/.*|\.snowflakecomputing\.com)$", "",
+                                  account_name, flags=re.IGNORECASE)
+            # 3. Take only the first segment in case the user included a path like account/region
+            account_name = account_name.split("/")[0].strip()
+
+            # Update the cleaned account name in the copy
+            conn_config["account"] = account_name
+
+        return conn_config
+
+    # --- Sync Helpers for Operator path ---
+
+    def _get_account_identifier_from_config(self, conn_config: dict[str, Any]) -> str:
+        """
+        Helper to compute account identifier from conn_config for sync use.
+        conn_config['account'] is now guaranteed to be clean.
+        """
         account_identifier = f"https://{conn_config['account']}"
 
-        if conn_config["region"]:
+        if conn_config.get("region"):
             account_identifier += f".{conn_config['region']}"
 
         return account_identifier
 
-    def get_private_key(self) -> None:
-        """Get the private key from snowflake connection."""
-        conn = self.get_connection(self.snowflake_conn_id)
+    @property
+    def account_identifier(self) -> str:
+        """
+        Returns snowflake account identifier. Used by synchronous Operator path.
+        This access is allowed in the synchronous execution path (Operator).
+        """
+        # Ensure this property explicitly calls the synchronous lookup method with cleaning
+        conn_config = self._get_cleaned_conn_params
+        return self._get_account_identifier_from_config(conn_config)
 
-        # If private_key_file is specified in the extra json, load the contents of the file as a private key.
-        # If private_key_content is specified in the extra json, use it as a private key.
-        # As a next step, specify this private key in the connection configuration.
-        # The connection password then becomes the passphrase for the private key.
-        # If your private key is not encrypted (not recommended), then leave the password empty.
+    def _get_private_key_sync(self, conn_config: dict[str, Any]) -> None:
+        """
+        Get the private key from snowflake connection (Synchronous, blocking I/O/CPU).
+        Requires the conn_config to be passed in to avoid internal self._get_conn_params calls.
+        """
+        conn = self.get_connection(self.snowflake_conn_id)
 
         private_key_file = conn.extra_dejson.get(
             "extra__snowflake__private_key_file"
@@ -131,25 +156,204 @@ class SnowflakeSqlApiHook(SnowflakeHook):
                 private_key_pem, password=passphrase, backend=default_backend()
             )
 
+    # NEW HELPER: Synchronous retrieval of connection parameters (required for asyncio.to_thread)
+    def _get_conn_config_sync(self) -> dict[str, Any]:
+        """Helper to retrieve the connection parameters synchronously for the async path."""
+        # This now uses the new property that cleans the account name
+        return self._get_cleaned_conn_params
+
+    # --- Asynchronous Helpers for Trigger path ---
+
+    async def _get_private_key_async(self, conn_config: dict[str, Any]) -> None:
+        """Run synchronous private key loading in a separate thread for the async path."""
+        if not self.private_key:
+            # Use asyncio.to_thread to run the blocking function without freezing the event loop
+            await asyncio.to_thread(self._get_private_key_sync, conn_config)
+
+    # --- Synchronous Authentication Methods (requests - Used by Operator) ---
+
+    def get_oauth_token(self) -> str:
+        """Generate temporary OAuth access token (Synchronous via requests)."""
+        # Use the cleaned parameters
+        conn_config = self._get_cleaned_conn_params
+        url = f"{self.account_identifier}.snowflakecomputing.com/oauth/token-request"
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": conn_config["refresh_token"],
+            "redirect_uri": conn_config.get("redirect_uri", "https://localhost.com"),
+        }
+        response = requests.post(
+            url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            auth=HTTPBasicAuth(conn_config["client_id"], conn_config["client_secret"]),
+        )
+
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:  # pragma: no cover
+            msg = f"Response: {e.response.content.decode()} Status Code: {e.response.status_code}"
+            raise AirflowException(msg)
+        return response.json()["access_token"]
+
+    def get_headers(self) -> dict[str, Any]:
+        """Form auth headers (Synchronous)."""
+        # Use the cleaned parameters
+        conn_config = self._get_cleaned_conn_params
+
+        # OAuth path
+        if all(
+            [conn_config.get("refresh_token"), conn_config.get("client_id"), conn_config.get("client_secret")]
+        ):
+            self.log.info("DEBUG: Using synchronous OAuth path for headers.")
+            oauth_token = self.get_oauth_token()
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {oauth_token}",
+                "Accept": "application/json",
+                "User-Agent": "snowflakeSQLAPI/1.0",
+                "X-Snowflake-Authorization-Token-Type": "OAUTH",
+            }
+            return headers
+
+        # JWT path
+        self.log.info("DEBUG: Using synchronous JWT path for headers.")
+        # Pass conn_config to _get_private_key_sync to avoid internal self._get_conn_params calls
+        if not self.private_key:
+            self._get_private_key_sync(conn_config)
+
+        token = JWTGenerator(
+            conn_config["account"],
+            conn_config["user"],
+            private_key=self.private_key,
+            lifetime=self.token_life_time,
+            renewal_delay=self.token_renewal_delta,
+        ).get_token()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "snowflakeSQLAPI/1.0",
+            "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT",
+        }
+        return headers
+
+    # --- Asynchronous Authentication Methods (aiohttp - Used by Trigger) ---
+
+    async def get_oauth_token_async(self, conn_config: dict[str, Any]) -> str:
+        """Generate temporary OAuth access token (Asynchronous via aiohttp)."""
+
+        # Construct account identifier for URL using the awaited conn_config
+        account_identifier = self._get_account_identifier_from_config(conn_config)
+
+        # Need to parse the URL correctly: remove the 'https://' prefix for the base URL component
+        base_url = account_identifier.replace("https://", "")
+        url = f"{base_url}.snowflakecomputing.com/oauth/token-request"
+
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": conn_config["refresh_token"],
+            "redirect_uri": conn_config.get("redirect_uri", "https://localhost.com"),
+        }
+
+        auth = aiohttp.BasicAuth(conn_config["client_id"], conn_config["client_secret"])
+
+        async with aiohttp.ClientSession(auth=auth) as session:
+            async with session.post(
+                url,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ) as response:
+                if response.status >= 400:
+                    response_content = await response.text()
+                    msg = f"Response: {response_content} Status Code: {response.status}"
+                    raise AirflowException(msg)
+
+                resp_json = await response.json()
+                return resp_json["access_token"]
+
+    async def get_headers_async(self) -> dict[str, Any]:
+        """Form auth headers (Asynchronous)."""
+
+        # CRITICAL FIX: Retrieve connection config non-blockingly (which includes cleaning)
+        conn_config = await asyncio.to_thread(self._get_conn_config_sync)
+
+        # OAuth path
+        if all(
+            [conn_config.get("refresh_token"), conn_config.get("client_id"), conn_config.get("client_secret")]
+        ):
+            self.log.info("DEBUG: Using asynchronous OAuth path for headers.")
+            oauth_token = await self.get_oauth_token_async(conn_config)
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {oauth_token}",
+                "Accept": "application/json",
+                "User-Agent": "snowflakeSQLAPI/1.0",
+                "X-Snowflake-Authorization-Token-Type": "OAUTH",
+            }
+            return headers
+
+        # JWT path
+        self.log.info("DEBUG: Using asynchronous JWT path for headers.")
+
+        # Ensure private key loading (blocking I/O) is run non-blockingly
+        if not self.private_key:
+            await self._get_private_key_async(conn_config)
+
+        # Ensure JWT generation (blocking CPU) is run non-blockingly
+        def generate_token_sync():
+            return JWTGenerator(
+                conn_config["account"],
+                conn_config["user"],
+                private_key=self.private_key,
+                lifetime=self.token_life_time,
+                renewal_delay=self.token_renewal_delta,
+            ).get_token()
+
+        token = await asyncio.to_thread(generate_token_sync)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "snowflakeSQLAPI/1.0",
+            "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT",
+        }
+        return headers
+
+    # --- Asynchronous Header/Param Builder (Used by Trigger) ---
+
+    async def get_request_url_header_params_async(self, query_id: str) -> tuple[
+        dict[str, Any], dict[str, Any], str]:
+        """
+        Build request header, URL, and params (Asynchronous).
+        """
+        req_id = uuid.uuid4()
+        # Await the async header getter
+        header = await self.get_headers_async()
+        params = {"requestId": str(req_id)}
+
+        # Get config safely again to build the URL (already cleaned)
+        conn_config = await asyncio.to_thread(self._get_conn_config_sync)
+        account_identifier = self._get_account_identifier_from_config(conn_config)
+
+        # The account_identifier now contains https://account.region, so we append the domain and path
+        url = f"{account_identifier}.snowflakecomputing.com/api/v2/statements/{query_id}"
+
+        return header, params, url
+
+    # --- Core Execution Methods (Synchronous versions retained for Operator) ---
+
     def execute_query(
         self, sql: str, statement_count: int, query_tag: str = "", bindings: dict[str, Any] | None = None
     ) -> list[str]:
-        """
-        Run the query in Snowflake using SnowflakeSQL API by making API request.
-
-        :param sql: the sql string to be executed with possibly multiple statements
-        :param statement_count: set the MULTI_STATEMENT_COUNT field to the number of SQL statements
-         in the request
-        :param query_tag: (Optional) Query tag that you want to associate with the SQL statement.
-            For details, see https://docs.snowflake.com/en/sql-reference/parameters.html#label-query-tag
-            parameter.
-        :param bindings: (Optional) Values of bind variables in the SQL statement.
-            When executing the statement, Snowflake replaces placeholders (? and :name) in
-            the statement with these specified values.
-        """
-        conn_config = self._get_conn_params
+        """Synchronous API call to execute query."""
+        # Use the cleaned parameters
+        conn_config = self._get_cleaned_conn_params
 
         req_id = uuid.uuid4()
+        # Use the property for the synchronous path (which uses cleaned params)
         url = f"{self.account_identifier}.snowflakecomputing.com/api/v2/statements"
         params: dict[str, Any] | None = {"requestId": str(req_id), "async": True, "pageSize": 10}
         headers = self.get_headers()
@@ -164,9 +368,6 @@ class SnowflakeSqlApiHook(SnowflakeHook):
         data = {
             "statement": sql,
             "resultSetMetaData": {"format": "json"},
-            # If database, schema, warehouse, role parameters have been provided set them accordingly
-            # If either of them has been not (Parent class initializes them to None in that case)
-            # set them to what in the Airflow connection configuration
             "database": self.database or conn_config["database"],
             "schema": self.schema or conn_config["schema"],
             "warehouse": self.warehouse or conn_config["warehouse"],
@@ -193,76 +394,8 @@ class SnowflakeSqlApiHook(SnowflakeHook):
             raise AirflowException("No statementHandle/statementHandles present in response")
         return self.query_ids
 
-    def get_headers(self) -> dict[str, Any]:
-        """Form auth headers based on either OAuth token or JWT token from private key."""
-        conn_config = self._get_conn_params
-
-        # Use OAuth if refresh_token and client_id and client_secret are provided
-        if all(
-            [conn_config.get("refresh_token"), conn_config.get("client_id"), conn_config.get("client_secret")]
-        ):
-            oauth_token = self.get_oauth_token()
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {oauth_token}",
-                "Accept": "application/json",
-                "User-Agent": "snowflakeSQLAPI/1.0",
-                "X-Snowflake-Authorization-Token-Type": "OAUTH",
-            }
-            return headers
-
-        # Alternatively, get the JWT token from the connection details and the private key
-        if not self.private_key:
-            self.get_private_key()
-
-        token = JWTGenerator(
-            conn_config["account"],  # type: ignore[arg-type]
-            conn_config["user"],  # type: ignore[arg-type]
-            private_key=self.private_key,
-            lifetime=self.token_life_time,
-            renewal_delay=self.token_renewal_delta,
-        ).get_token()
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "snowflakeSQLAPI/1.0",
-            "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT",
-        }
-        return headers
-
-    def get_oauth_token(self) -> str:
-        """Generate temporary OAuth access token using refresh token in connection details."""
-        conn_config = self._get_conn_params
-        url = f"{self.account_identifier}.snowflakecomputing.com/oauth/token-request"
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": conn_config["refresh_token"],
-            "redirect_uri": conn_config.get("redirect_uri", "https://localhost.com"),
-        }
-        response = requests.post(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            auth=HTTPBasicAuth(conn_config["client_id"], conn_config["client_secret"]),  # type: ignore[arg-type]
-        )
-
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:  # pragma: no cover
-            msg = f"Response: {e.response.content.decode()} Status Code: {e.response.status_code}"
-            raise AirflowException(msg)
-        return response.json()["access_token"]
-
     def get_request_url_header_params(self, query_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
-        """
-        Build the request header Url with account name identifier and query id from the connection params.
-
-        :param query_id: statement handles query ids for the individual statements.
-        """
+        """Synchronous builder for request header, URL, and params."""
         req_id = uuid.uuid4()
         header = self.get_headers()
         params = {"requestId": str(req_id)}
@@ -270,11 +403,7 @@ class SnowflakeSqlApiHook(SnowflakeHook):
         return header, params, url
 
     def check_query_output(self, query_ids: list[str]) -> None:
-        """
-        Make HTTP request to snowflake SQL API based on the provided query ids and log the response.
-
-        :param query_ids: statement handles query id for the individual statements.
-        """
+        """Synchronous API call to check query output."""
         for query_id in query_ids:
             header, params, url = self.get_request_url_header_params(query_id)
             try:
@@ -306,11 +435,8 @@ class SnowflakeSqlApiHook(SnowflakeHook):
         return {"status": "error", "message": resp["message"]}
 
     def get_sql_api_query_status(self, query_id: str) -> dict[str, str | list[str]]:
-        """
-        Based on the query id async HTTP request is made to snowflake SQL API and return response.
-
-        :param query_id: statement handle id for the individual statements.
-        """
+        """Synchronous API call to get query status."""
+        self.log.info("DEBUG: Entering synchronous query status check path.")
         self.log.info("Retrieving status for query id %s", query_id)
         header, params, url = self.get_request_url_header_params(query_id)
         response = requests.get(url, params=params, headers=header)
@@ -318,18 +444,27 @@ class SnowflakeSqlApiHook(SnowflakeHook):
         resp = response.json()
         return self._process_response(status_code, resp)
 
-    async def get_sql_api_query_status_async(self, query_id: str) -> dict[str, str | list[str]]:
-        """
-        Based on the query id async HTTP request is made to snowflake SQL API and return response.
+    # --- Core Asynchronous Execution Method (Used by Trigger) ---
 
-        :param query_id: statement handle id for the individual statements.
-        """
+    async def get_sql_api_query_status_async(self, query_id: str) -> dict[str, str | list[str]]:
+        """Asynchronous API call to get query status."""
+        self.log.info("DEBUG: Entering ASYNCHRONOUS query status check path.")
         self.log.info("Retrieving status for query id %s", query_id)
-        header, params, url = self.get_request_url_header_params(query_id)
-        async with (
-            aiohttp.ClientSession(headers=header) as session,
-            session.get(url, params=params) as response,
-        ):
-            status_code = response.status
-            resp = await response.json()
-            return self._process_response(status_code, resp)
+
+        try:
+            # Call the fully asynchronous header/param builder here
+            header, params, url = await self.get_request_url_header_params_async(query_id)
+
+            async with (
+                aiohttp.ClientSession(headers=header) as session,
+                session.get(url, params=params) as response,
+            ):
+                status_code = response.status
+                resp = await response.json()
+                return self._process_response(status_code, resp)
+        except Exception as e:
+            self.log.error("FATAL ASYNC ERROR: Failed to execute non-blocking call in Trigger.")
+            self.log.error(f"Error Type: {type(e).__name__}, Message: {e}")
+            self.log.error("Traceback:\n%s", traceback.format_exc())
+            raise
+

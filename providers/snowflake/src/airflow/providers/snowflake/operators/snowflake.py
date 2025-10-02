@@ -1,4 +1,3 @@
-#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,12 +14,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
 from __future__ import annotations
 
 import time
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, SupportsAbs, cast
+from typing import TYPE_CHECKING, Any, SupportsAbs, cast, AsyncIterator
+
+import aiohttp
+import asyncio
 
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException
@@ -31,7 +35,9 @@ from airflow.providers.common.sql.operators.sql import (
     SQLValueCheckOperator,
 )
 from airflow.providers.snowflake.hooks.snowflake_sql_api import SnowflakeSqlApiHook
-from airflow.providers.snowflake.triggers.snowflake_trigger import SnowflakeSqlApiTrigger
+# We keep this import to satisfy the original file structure, but we won't use it for deferral
+from airflow.providers.snowflake.triggers.snowflake_trigger import CustomSnowflakeSqlApiTrigger
+from airflow.triggers.base import BaseTrigger, TriggerEvent  # Base classes needed
 
 if TYPE_CHECKING:
     try:
@@ -40,324 +46,18 @@ if TYPE_CHECKING:
         # TODO: Remove once provider drops support for Airflow 2
         from airflow.utils.context import Context
 
-
-class SnowflakeCheckOperator(SQLCheckOperator):
-    """
-    Perform a check against Snowflake.
-
-    The ``SnowflakeCheckOperator`` expects a sql query that will return a single row. Each
-    value on that first row is evaluated using python ``bool`` casting. If any of the values
-    return ``False`` the check is failed and errors out.
-
-    Note that Python bool casting evals the following as ``False``:
-
-    * ``False``
-    * ``0``
-    * Empty string (``""``)
-    * Empty list (``[]``)
-    * Empty dictionary or set (``{}``)
-
-    Given a query like ``SELECT COUNT(*) FROM foo``, it will fail only if
-    the count ``== 0``. You can craft much more complex query that could,
-    for instance, check that the table has the same number of rows as
-    the source table upstream, or that the count of today's partition is
-    greater than yesterday's partition, or that a set of metrics are less
-    than 3 standard deviation for the 7 day average.
-
-    This operator can be used as a data quality check in your pipeline, and
-    depending on where you put it in your DAG, you have the choice to
-    stop the critical path, preventing from
-    publishing dubious data, or on the side and receive email alerts
-    without stopping the progress of the DAG.
-
-    :param sql: the SQL code to be executed as a single string, or
-        a list of str (sql statements), or a reference to a template file.
-        Template references are recognized by str ending in '.sql'
-    :param snowflake_conn_id: Reference to
-        :ref:`Snowflake connection id<howto/connection:snowflake>`
-    :param autocommit: if True, each command is automatically committed.
-        (default value: True)
-    :param parameters: (optional) the parameters to render the SQL query with.
-    :param warehouse: name of warehouse (will overwrite any warehouse
-        defined in the connection's extra JSON)
-    :param database: name of database (will overwrite database defined
-        in connection)
-    :param schema: name of schema (will overwrite schema defined in
-        connection)
-    :param role: name of role (will overwrite any role defined in
-        connection's extra JSON)
-    :param authenticator: authenticator for Snowflake.
-        'snowflake' (default) to use the internal Snowflake authenticator
-        'externalbrowser' to authenticate using your web browser and
-        Okta, ADFS or any other SAML 2.0-compliant identify provider
-        (IdP) that has been defined for your account
-        'https://<your_okta_account_name>.okta.com' to authenticate
-        through native Okta.
-    :param session_parameters: You can set session-level parameters at
-        the time you connect to Snowflake
-    """
-
-    template_fields: Sequence[str] = tuple(set(SQLCheckOperator.template_fields) | {"snowflake_conn_id"})
-    template_ext: Sequence[str] = (".sql",)
-    ui_color = "#ededed"
-    conn_id_field = "snowflake_conn_id"
-
-    def __init__(
-        self,
-        *,
-        sql: str,
-        snowflake_conn_id: str = "snowflake_default",
-        parameters: Iterable | Mapping[str, Any] | None = None,
-        autocommit: bool = True,
-        do_xcom_push: bool = True,
-        warehouse: str | None = None,
-        database: str | None = None,
-        role: str | None = None,
-        schema: str | None = None,
-        authenticator: str | None = None,
-        session_parameters: dict | None = None,
-        **kwargs,
-    ) -> None:
-        self.snowflake_conn_id = snowflake_conn_id
-        if any([warehouse, database, role, schema, authenticator, session_parameters]):
-            hook_params = kwargs.pop("hook_params", {})
-            kwargs["hook_params"] = {
-                "warehouse": warehouse,
-                "database": database,
-                "role": role,
-                "schema": schema,
-                "authenticator": authenticator,
-                "session_parameters": session_parameters,
-                **hook_params,
-            }
-        super().__init__(sql=sql, parameters=parameters, conn_id=snowflake_conn_id, **kwargs)
-        self.query_ids: list[str] = []
-
-
-class SnowflakeValueCheckOperator(SQLValueCheckOperator):
-    """
-    Performs a simple check using sql code against a specified value, within a certain level of tolerance.
-
-    :param sql: the sql to be executed
-    :param pass_value: the value to check against
-    :param tolerance: (optional) the tolerance allowed to accept the query as
-        passing
-    :param snowflake_conn_id: Reference to
-        :ref:`Snowflake connection id<howto/connection:snowflake>`
-    :param autocommit: if True, each command is automatically committed.
-        (default value: True)
-    :param parameters: (optional) the parameters to render the SQL query with.
-    :param warehouse: name of warehouse (will overwrite any warehouse
-        defined in the connection's extra JSON)
-    :param database: name of database (will overwrite database defined
-        in connection)
-    :param schema: name of schema (will overwrite schema defined in
-        connection)
-    :param role: name of role (will overwrite any role defined in
-        connection's extra JSON)
-    :param authenticator: authenticator for Snowflake.
-        'snowflake' (default) to use the internal Snowflake authenticator
-        'externalbrowser' to authenticate using your web browser and
-        Okta, ADFS or any other SAML 2.0-compliant identify provider
-        (IdP) that has been defined for your account
-        'https://<your_okta_account_name>.okta.com' to authenticate
-        through native Okta.
-    :param session_parameters: You can set session-level parameters at
-        the time you connect to Snowflake
-    """
-
-    template_fields: Sequence[str] = tuple(set(SQLValueCheckOperator.template_fields) | {"snowflake_conn_id"})
-
-    conn_id_field = "snowflake_conn_id"
-
-    def __init__(
-        self,
-        *,
-        sql: str,
-        pass_value: Any,
-        tolerance: Any = None,
-        snowflake_conn_id: str = "snowflake_default",
-        parameters: Iterable | Mapping[str, Any] | None = None,
-        autocommit: bool = True,
-        do_xcom_push: bool = True,
-        warehouse: str | None = None,
-        database: str | None = None,
-        role: str | None = None,
-        schema: str | None = None,
-        authenticator: str | None = None,
-        session_parameters: dict | None = None,
-        **kwargs,
-    ) -> None:
-        self.snowflake_conn_id = snowflake_conn_id
-        if any([warehouse, database, role, schema, authenticator, session_parameters]):
-            hook_params = kwargs.pop("hook_params", {})
-            kwargs["hook_params"] = {
-                "warehouse": warehouse,
-                "database": database,
-                "role": role,
-                "schema": schema,
-                "authenticator": authenticator,
-                "session_parameters": session_parameters,
-                **hook_params,
-            }
-        super().__init__(
-            sql=sql, pass_value=pass_value, tolerance=tolerance, conn_id=snowflake_conn_id, **kwargs
-        )
-        self.query_ids: list[str] = []
-
-
-class SnowflakeIntervalCheckOperator(SQLIntervalCheckOperator):
-    """
-    Checks that the metrics given as SQL expressions are within tolerance of the ones from days_back before.
-
-    This method constructs a query like so ::
-
-        SELECT {metrics_threshold_dict_key} FROM {table}
-        WHERE {date_filter_column}=<date>
-
-    :param table: the table name
-    :param days_back: number of days between ds and the ds we want to check
-        against. Defaults to 7 days
-    :param metrics_thresholds: a dictionary of ratios indexed by metrics, for
-        example 'COUNT(*)': 1.5 would require a 50 percent or less difference
-        between the current day, and the prior days_back.
-    :param snowflake_conn_id: Reference to
-        :ref:`Snowflake connection id<howto/connection:snowflake>`
-    :param autocommit: if True, each command is automatically committed.
-        (default value: True)
-    :param parameters: (optional) the parameters to render the SQL query with.
-    :param warehouse: name of warehouse (will overwrite any warehouse
-        defined in the connection's extra JSON)
-    :param database: name of database (will overwrite database defined
-        in connection)
-    :param schema: name of schema (will overwrite schema defined in
-        connection)
-    :param role: name of role (will overwrite any role defined in
-        connection's extra JSON)
-    :param authenticator: authenticator for Snowflake.
-        'snowflake' (default) to use the internal Snowflake authenticator
-        'externalbrowser' to authenticate using your web browser and
-        Okta, ADFS or any other SAML 2.0-compliant identify provider
-        (IdP) that has been defined for your account
-        'https://<your_okta_account_name>.okta.com' to authenticate
-        through native Okta.
-    :param session_parameters: You can set session-level parameters at
-        the time you connect to Snowflake
-    """
-
-    template_fields: Sequence[str] = tuple(
-        set(SQLIntervalCheckOperator.template_fields) | {"snowflake_conn_id"}
-    )
-    conn_id_field = "snowflake_conn_id"
-
-    def __init__(
-        self,
-        *,
-        table: str,
-        metrics_thresholds: dict,
-        date_filter_column: str = "ds",
-        days_back: SupportsAbs[int] = -7,
-        snowflake_conn_id: str = "snowflake_default",
-        parameters: Iterable | Mapping[str, Any] | None = None,
-        autocommit: bool = True,
-        do_xcom_push: bool = True,
-        warehouse: str | None = None,
-        database: str | None = None,
-        role: str | None = None,
-        schema: str | None = None,
-        authenticator: str | None = None,
-        session_parameters: dict | None = None,
-        **kwargs,
-    ) -> None:
-        self.snowflake_conn_id = snowflake_conn_id
-        if any([warehouse, database, role, schema, authenticator, session_parameters]):
-            hook_params = kwargs.pop("hook_params", {})
-            kwargs["hook_params"] = {
-                "warehouse": warehouse,
-                "database": database,
-                "role": role,
-                "schema": schema,
-                "authenticator": authenticator,
-                "session_parameters": session_parameters,
-                **hook_params,
-            }
-        super().__init__(
-            table=table,
-            metrics_thresholds=metrics_thresholds,
-            date_filter_column=date_filter_column,
-            days_back=days_back,
-            conn_id=snowflake_conn_id,
-            **kwargs,
-        )
-        self.query_ids: list[str] = []
-
+# ----------------------------------------------------------------------
+# 2. MODIFIED OPERATOR
+# ----------------------------------------------------------------------
 
 class SnowflakeSqlApiOperator(SQLExecuteQueryOperator):
     """
-    Implemented Snowflake SQL API Operator to support multiple SQL statements sequentially.
-
-    This is the behavior of the SQLExecuteQueryOperator, the Snowflake SQL API allows submitting
-    multiple SQL statements in a single request. It make post request to submit SQL
-    statements for execution, poll to check the status of the execution of a statement. Fetch query results
-    concurrently.
-    This Operator currently uses key pair authentication, so you need to provide private key raw content or
-    private key file path in the snowflake connection along with other details
-
-    .. seealso::
-
-        `Snowflake SQL API key pair Authentication <https://docs.snowflake.com/en/developer-guide/sql-api/authenticating.html#label-sql-api-authenticating-key-pair>`_
-
-    Where can this operator fit in?
-         - To execute multiple SQL statements in a single request
-         - To execute the SQL statement asynchronously and to execute standard queries and most DDL and DML statements
-         - To develop custom applications and integrations that perform queries
-         - To create provision users and roles, create table, etc.
-
-    The following commands are not supported:
-        - The PUT command (in Snowflake SQL)
-        - The GET command (in Snowflake SQL)
-        - The CALL command with stored procedures that return a table(stored procedures with the RETURNS TABLE clause).
-
-    .. seealso::
-
-        - `Snowflake SQL API <https://docs.snowflake.com/en/developer-guide/sql-api/intro.html#introduction-to-the-sql-api>`_
-        - `API Reference <https://docs.snowflake.com/en/developer-guide/sql-api/reference.html#snowflake-sql-api-reference>`_
-        - `Limitation on snowflake SQL API <https://docs.snowflake.com/en/developer-guide/sql-api/intro.html#limitations-of-the-sql-api>`_
-
-    :param snowflake_conn_id: Reference to Snowflake connection id
-    :param sql: the sql code to be executed. (templated)
-    :param autocommit: if True, each command is automatically committed.
-        (default value: True)
-    :param parameters: (optional) the parameters to render the SQL query with.
-    :param warehouse: name of warehouse (will overwrite any warehouse
-        defined in the connection's extra JSON)
-    :param database: name of database (will overwrite database defined
-        in connection)
-    :param schema: name of schema (will overwrite schema defined in
-        connection)
-    :param role: name of role (will overwrite any role defined in
-        connection's extra JSON)
-    :param authenticator: authenticator for Snowflake.
-        'snowflake' (default) to use the internal Snowflake authenticator
-        'externalbrowser' to authenticate using your web browser and
-        Okta, ADFS or any other SAML 2.0-compliant identify provider
-        (IdP) that has been defined for your account
-        'https://<your_okta_account_name>.okta.com' to authenticate
-        through native Okta.
-    :param session_parameters: You can set session-level parameters at
-        the time you connect to Snowflake
-    :param poll_interval: the interval in seconds to poll the query
-    :param statement_count: Number of SQL statement to be executed
-    :param token_life_time: lifetime of the JWT Token
-    :param token_renewal_delta: Renewal time of the JWT Token
-    :param bindings: (Optional) Values of bind variables in the SQL statement.
-            When executing the statement, Snowflake replaces placeholders (? and :name) in
-            the statement with these specified values.
-    :param deferrable: Run operator in the deferrable mode.
+    Modified Snowflake SQL API Operator to fix the AsyncToSync error by pre-calculating
+    authentication details on the Worker and passing them to a pure async Trigger.
     """
 
-    LIFETIME = timedelta(minutes=59)  # The tokens will have a 59 minutes lifetime
-    RENEWAL_DELTA = timedelta(minutes=54)  # Tokens will be renewed after 54 minutes
+    LIFETIME = timedelta(minutes=59)
+    RENEWAL_DELTA = timedelta(minutes=54)
 
     template_fields: Sequence[str] = tuple(
         set(SQLExecuteQueryOperator.template_fields) | {"snowflake_conn_id"}
@@ -403,11 +103,56 @@ class SnowflakeSqlApiOperator(SQLExecuteQueryOperator):
             }
         super().__init__(conn_id=snowflake_conn_id, **kwargs)  # pragma: no cover
 
+    def _get_deferred_auth_params(self, hook: SnowflakeSqlApiHook) -> tuple[str, dict[str, str]]:
+        """
+        Synchronously generates the URL and Authorization Headers on the Worker
+        by calling the synchronous get_headers() method on the Hook.
+        """
+        conn = hook.get_connection(hook.snowflake_conn_id)
+
+        try:
+            # FIX 1: Call the synchronous method that generates the token for either JWT or OAuth
+            full_headers = hook.get_headers()
+            auth_header = full_headers.get("Authorization")
+
+            if not auth_header:
+                raise AirflowException(
+                    "Authorization header not found after calling hook.get_headers(). "
+                    "Check that your Snowflake connection is properly configured for Keypair or OAuth."
+                )
+
+            self.log.info("Successfully retrieved Authorization header using hook.get_headers().")
+
+        except Exception as e:
+            # Raise a specific error if authentication fails during deferral setup
+            raise AirflowException(
+                f"Failed to retrieve Authorization header synchronously from the hook via get_headers(). "
+                f"Original error: {e}"
+            )
+
+        # 1. Build Base API URL
+        # FIX 2: Use hook.account_identifier (which is available on your hook)
+        # to construct the full base URL, avoiding the missing 'get_account_name()' method.
+        # account_identifier returns the full URL base (e.g., 'https://account.region.snowflakecomputing.com')
+        account_identifier = hook.account_identifier.rstrip("/")
+        api_url = f"{account_identifier}.snowflakecomputing.com"
+
+
+        # 2. Build the Auth Headers for the Trigger
+        auth_headers = {
+            "Authorization": auth_header,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            # Pass the currently used role, extracted from the hook or connection
+            "sf-role": hook.role or conn.extra_dejson.get("role", ""),
+        }
+
+        return api_url, auth_headers
+
     def execute(self, context: Context) -> None:
         """
-        Make a POST API request to snowflake by using SnowflakeSQL and execute the query to get the ids.
-
-        By deferring the SnowflakeSqlApiTrigger class passed along with query ids.
+        Submits the query and defers using the SnowflakeSqlApiTrigger
+        with pre-calculated headers if deferrable=True.
         """
         self.log.info("Executing: %s", self.sql)
         self._hook = SnowflakeSqlApiHook(
@@ -443,14 +188,19 @@ class SnowflakeSqlApiOperator(SQLExecuteQueryOperator):
             return
 
         if self.deferrable:
+            self.log.info("Deferring task using CustomSnowflakeSqlApiTrigger to avoid AsyncToSync error.")
+
+            # 1. Synchronously get auth parameters on the Worker
+            api_url, auth_headers = self._get_deferred_auth_params(self._hook)
+
+            # 2. Defer using the custom trigger and static parameters
             self.defer(
                 timeout=self.execution_timeout,
-                trigger=SnowflakeSqlApiTrigger(
+                trigger=CustomSnowflakeSqlApiTrigger(
                     poll_interval=self.poll_interval,
                     query_ids=self.query_ids,
-                    snowflake_conn_id=self.snowflake_conn_id,
-                    token_life_time=self.token_life_time,
-                    token_renewal_delta=self.token_renewal_delta,
+                    api_url=api_url,
+                    auth_headers=auth_headers,
                 ),
                 method_name="execute_complete",
             )
@@ -510,3 +260,138 @@ class SnowflakeSqlApiOperator(SQLExecuteQueryOperator):
                 self.log.info("%s completed successfully.", self.task_id)
         else:
             self.log.info("%s completed successfully.", self.task_id)
+
+
+class SnowflakeCheckOperator(SQLCheckOperator):
+    template_fields: Sequence[str] = tuple(set(SQLCheckOperator.template_fields) | {"snowflake_conn_id"})
+    template_ext: Sequence[str] = (".sql",)
+    ui_color = "#ededed"
+    conn_id_field = "snowflake_conn_id"
+
+    def __init__(
+        self,
+        *,
+        sql: str,
+        snowflake_conn_id: str = "snowflake_default",
+        parameters: Iterable | Mapping[str, Any] | None = None,
+        autocommit: bool = True,
+        do_xcom_push: bool = True,
+        warehouse: str | None = None,
+        database: str | None = None,
+        role: str | None = None,
+        schema: str | None = None,
+        authenticator: str | None = None,
+        session_parameters: dict | None = None,
+        **kwargs,
+    ) -> None:
+        self.snowflake_conn_id = snowflake_conn_id
+        if any([warehouse, database, role, schema, authenticator, session_parameters]):
+            hook_params = kwargs.pop("hook_params", {})
+            kwargs["hook_params"] = {
+                "warehouse": warehouse,
+                "database": database,
+                "role": role,
+                "schema": schema,
+                "authenticator": authenticator,
+                "session_parameters": session_parameters,
+                **hook_params,
+            }
+        super().__init__(sql=sql, parameters=parameters, conn_id=snowflake_conn_id, **kwargs)
+        self.query_ids: list[str] = []
+
+
+class SnowflakeValueCheckOperator(SQLValueCheckOperator):
+    template_fields: Sequence[str] = tuple(set(SQLValueCheckOperator.template_fields) | {"snowflake_conn_id"})
+    conn_id_field = "snowflake_conn_id"
+
+    def __init__(
+        self,
+        *,
+        sql: str,
+        pass_value: Any,
+        tolerance: Any = None,
+        snowflake_conn_id: str = "snowflake_default",
+        parameters: Iterable | Mapping[str, Any] | None = None,
+        autocommit: bool = True,
+        do_xcom_push: bool = True,
+        warehouse: str | None = None,
+        database: str | None = None,
+        role: str | None = None,
+        schema: str | None = None,
+        authenticator: str | None = None,
+        session_parameters: dict | None = None,
+        **kwargs,
+    ) -> None:
+        self.snowflake_conn_id = snowflake_conn_id
+        if any([warehouse, database, role, schema, authenticator, session_parameters]):
+            hook_params = kwargs.pop("hook_params", {})
+            kwargs["hook_params"] = {
+                "warehouse": warehouse,
+                "database": database,
+                "role": role,
+                "schema": schema,
+                "authenticator": authenticator,
+                "session_parameters": session_parameters,
+                **hook_params,
+            }
+        super().__init__(
+            sql=sql, pass_value=pass_value, tolerance=tolerance, conn_id=snowflake_conn_id, **kwargs
+        )
+        self.query_ids: list[str] = []
+
+
+class SnowflakeIntervalCheckOperator(SQLIntervalCheckOperator):
+    template_fields: Sequence[str] = tuple(
+        set(SQLIntervalCheckOperator.template_fields) | {"snowflake_conn_id"}
+    )
+    conn_id_field = "snowflake_conn_id"
+
+    def __init__(
+        self,
+        *,
+        table: str,
+        metrics_thresholds: dict,
+        date_filter_column: str = "ds",
+        days_back: SupportsAbs[int] = -7,
+        snowflake_conn_id: str = "snowflake_default",
+        parameters: Iterable | Mapping[str, Any] | None = None,
+        autocommit: bool = True,
+        do_xcom_push: bool = True,
+        warehouse: str | None = None,
+        database: str | None = None,
+        role: str | None = None,
+        schema: str | None = None,
+        authenticator: str | None = None,
+        session_parameters: dict | None = None,
+        **kwargs,
+    ) -> None:
+        self.snowflake_conn_id = snowflake_conn_id
+        if any([warehouse, database, role, schema, authenticator, session_parameters]):
+            hook_params = kwargs.pop("hook_params", {})
+            kwargs["hook_params"] = {
+                "warehouse": warehouse,
+                "database": database,
+                "role": role,
+                "schema": schema,
+                "authenticator": authenticator,
+                "session_parameters": session_parameters,
+                **hook_params,
+            }
+        super().__init__(
+            table=table,
+            metrics_thresholds=metrics_thresholds,
+            date_filter_column=date_filter_column,
+            days_back=days_back,
+            conn_id=snowflake_conn_id,
+            **kwargs,
+        )
+        self.query_ids: list[str] = []
+
+
+
+
+
+
+
+
+

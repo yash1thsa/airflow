@@ -586,6 +586,7 @@ class DbApiHook(BaseHook):
         :param sql: the sql statement to be executed (str) or a list of sql statements to execute
         :param parameters: The parameters to render the SQL query with.
         """
+        self.log.debug("DbApiHook.get_records called with handler: fetch_all_handler")
         return self.run(sql=sql, parameters=parameters, handler=handlers.fetch_all_handler)
 
     def get_first(self, sql: str | list[str], parameters: Iterable | Mapping[str, Any] | None = None) -> Any:
@@ -595,6 +596,7 @@ class DbApiHook(BaseHook):
         :param sql: the sql statement to be executed (str) or a list of sql statements to execute
         :param parameters: The parameters to render the SQL query with.
         """
+        self.log.debug("DbApiHook.get_first called with handler: fetch_one_handler")
         return self.run(sql=sql, parameters=parameters, handler=handlers.fetch_one_handler)
 
     @staticmethod
@@ -704,6 +706,15 @@ class DbApiHook(BaseHook):
         :param return_last: Whether to return result for only last statement or for all after split
         :return: if handler provided, returns query results (may be list of results depending on params)
         """
+        self.log.debug(
+            "DbApiHook.run called. sql_type: %s, autocommit: %s, handler_set: %s, split_statements: %s, return_last: %s",
+            type(sql).__name__,
+            autocommit,
+            handler is not None,
+            split_statements,
+            return_last,
+        )
+
         self.descriptions = []
 
         if isinstance(sql, str):
@@ -712,25 +723,46 @@ class DbApiHook(BaseHook):
                     sql=sql,
                     strip_semicolon=self.strip_semicolon,
                 )
+                self.log.debug("SQL is string, split_statements=True. Statements will be split.")
             else:
                 sql_list = [sql] if sql.strip() else []
+                self.log.debug("SQL is string, split_statements=False. Executing as a single statement (or empty).")
         else:
             sql_list = sql
+            self.log.debug("SQL is an iterable (list/tuple).")
 
-        if sql_list:
-            self.log.debug("Executing following statements against DB: %s", sql_list)
-        else:
+        # Convert to list to check size and avoid double iteration
+        sql_list = list(sql_list)
+
+        if not sql_list:
             raise ValueError("List of SQL statements is empty")
+
+        self.log.debug("Executing %d statements against DB.", len(sql_list))
+
         _last_result = None
+        _last_description = None
         with self._create_autocommit_connection(autocommit) as conn:
+            self.log.debug("Connection established.")
             with closing(conn.cursor()) as cur:
                 results = []
-                for sql_statement in sql_list:
+                for idx, sql_statement in enumerate(sql_list):
+                    sql_short = sql_statement[:80].replace('\n', ' ') + ('...' if len(sql_statement) > 80 else '')
+                    self.log.debug("--- Starting statement %d of %d: %s", idx + 1, len(sql_list), sql_short)
+
                     self._run_command(cur, sql_statement, parameters)
 
                     if handler is not None:
                         result = self._make_common_data_structure(handler(cur))
-                        if handlers.return_single_query_results(sql, return_last, split_statements):
+                        is_single_result_mode = handlers.return_single_query_results(sql, return_last, split_statements)
+
+                        self.log.debug(
+                            "Statement %d completed. Single result mode: %s. Result type after common data structure: %s",
+                            idx + 1,
+                            is_single_result_mode,
+                            type(result).__name__,
+                        )
+
+                        if is_single_result_mode:
                             _last_result = result
                             _last_description = cur.description
                         else:
@@ -740,14 +772,19 @@ class DbApiHook(BaseHook):
             # If autocommit was set to False or db does not support autocommit, we do a manual commit.
             if not self.get_autocommit(conn):
                 conn.commit()
+                self.log.debug("Manual commit performed.")
             # Logs all database messages or errors sent to the client
             self.get_db_log_messages(conn)
+            self.log.debug("Connection closed.")
 
         if handler is None:
+            self.log.debug("Handler is None, returning None.")
             return None
         if handlers.return_single_query_results(sql, return_last, split_statements):
             self.descriptions = [_last_description]
+            self.log.debug("Returning single last result. Result structure: %s", type(_last_result).__name__)
             return _last_result
+        self.log.debug("Returning list of all results. Total results: %d.", len(results))
         return results
 
     def _make_common_data_structure(self, result: T | Sequence[T]) -> tuple | list[tuple]:
@@ -762,259 +799,24 @@ class DbApiHook(BaseHook):
         If this method is not overridden, the result data is returned as-is. If the output of the cursor
         is already a common data structure, this method should be ignored.
         """
+        self.log.debug("DbApiHook._make_common_data_structure input type: %s", type(result).__name__)
         if isinstance(result, Sequence):
+            self.log.debug("DbApiHook._make_common_data_structure returning list[tuple].")
             return cast("list[tuple]", result)
+        self.log.debug("DbApiHook._make_common_data_structure returning tuple.")
         return cast("tuple", result)
 
     def _run_command(self, cur, sql_statement, parameters):
         """Run a statement using an already open cursor."""
+        self.log.debug("--- DbApiHook._run_command started ---")
         if self.log_sql:
             self.log.info("Running statement: %s, parameters: %s", sql_statement, parameters)
 
         if parameters:
             cur.execute(sql_statement, parameters)
+            self.log.debug("Cursor executed with parameters.")
         else:
             cur.execute(sql_statement)
+            self.log.debug("Cursor executed without parameters.")
+        self.log.debug("--- DbApiHook._run_command finished ---")
 
-        # According to PEP 249, this is -1 when query result is not applicable.
-        if cur.rowcount >= 0:
-            self.log.info("Rows affected: %s", cur.rowcount)
-
-    def set_autocommit(self, conn, autocommit):
-        """Set the autocommit flag on the connection."""
-        if not self.supports_autocommit and autocommit:
-            self.log.warning(
-                "%s connection doesn't support autocommit but autocommit activated.",
-                self.get_conn_id(),
-            )
-        conn.autocommit = autocommit
-
-    def get_autocommit(self, conn) -> bool:
-        """
-        Get autocommit setting for the provided connection.
-
-        :param conn: Connection to get autocommit setting from.
-        :return: connection autocommit setting. True if ``autocommit`` is set
-            to True on the connection. False if it is either not set, set to
-            False, or the connection does not support auto-commit.
-        """
-        return getattr(conn, "autocommit", False) and self.supports_autocommit
-
-    def get_cursor(self) -> Any:
-        """Return a cursor."""
-        return self.get_conn().cursor()
-
-    def _generate_insert_sql(self, table, values, target_fields=None, replace: bool = False, **kwargs) -> str:
-        """
-        Generate the INSERT SQL statement.
-
-        The REPLACE variant is specific to MySQL syntax, the UPSERT variant is specific to SAP Hana syntax
-
-        :param table: Name of the target table
-        :param values: The row to insert into the table
-        :param target_fields: The names of the columns to fill in the table. If no target fields are
-            specified, they will be determined dynamically from the table's metadata.
-        :param replace: Whether to replace/upsert instead of insert
-        :return: The generated INSERT or REPLACE/UPSERT SQL statement
-        """
-        if not target_fields and self._resolve_target_fields:
-            with suppress(Exception):
-                target_fields = self.dialect.get_target_fields(table)
-
-        if replace:
-            return self.dialect.generate_replace_sql(table, values, target_fields, **kwargs)
-
-        return self.dialect.generate_insert_sql(table, values, target_fields, **kwargs)
-
-    @contextmanager
-    def _create_autocommit_connection(self, autocommit: bool = False):
-        """Context manager that closes the connection after use and detects if autocommit is supported."""
-        with closing(self.get_conn()) as conn:
-            if self.supports_autocommit:
-                self.set_autocommit(conn, autocommit)
-            yield conn
-
-    def insert_rows(
-        self,
-        table,
-        rows,
-        target_fields=None,
-        commit_every=1000,
-        replace=False,
-        *,
-        executemany=False,
-        fast_executemany=False,
-        autocommit=False,
-        **kwargs,
-    ):
-        """
-        Insert a collection of tuples into a table.
-
-        Rows are inserted in chunks, each chunk (of size ``commit_every``) is
-        done in a new transaction.
-
-        :param table: Name of the target table
-        :param rows: The rows to insert into the table
-        :param target_fields: The names of the columns to fill in the table
-        :param commit_every: The maximum number of rows to insert in one
-            transaction. Set to 0 to insert all rows in one transaction.
-        :param replace: Whether to replace instead of insert
-        :param executemany: If True, all rows are inserted at once in
-            chunks defined by the commit_every parameter. This only works if all rows
-            have same number of column names, but leads to better performance.
-        :param fast_executemany: If True, the `fast_executemany` parameter will be set on the
-            cursor used by `executemany` which leads to better performance, if supported by driver.
-        :param autocommit: What to set the connection's autocommit setting to
-            before executing the query.
-        """
-        nb_rows = 0
-        with self._create_autocommit_connection(autocommit) as conn:
-            conn.commit()
-            with closing(conn.cursor()) as cur:
-                if self.supports_executemany or executemany:
-                    if fast_executemany:
-                        with contextlib.suppress(AttributeError):
-                            # Try to set the fast_executemany attribute
-                            cur.fast_executemany = True
-                            self.log.info(
-                                "Fast_executemany is enabled for conn_id '%s'!",
-                                self.get_conn_id(),
-                            )
-
-                    for chunked_rows in chunked(rows, commit_every):
-                        values = list(
-                            map(
-                                lambda row: self._serialize_cells(row, conn),
-                                chunked_rows,
-                            )
-                        )
-                        sql = self._generate_insert_sql(table, values[0], target_fields, replace, **kwargs)
-                        self.log.debug("Generated sql: %s", sql)
-                        cur.executemany(sql, values)
-                        conn.commit()
-                        nb_rows += len(chunked_rows)
-                        self.log.info("Loaded %s rows into %s so far", nb_rows, table)
-                else:
-                    for i, row in enumerate(rows, 1):
-                        values = self._serialize_cells(row, conn)
-                        sql = self._generate_insert_sql(table, values, target_fields, replace, **kwargs)
-                        self.log.debug("Generated sql: %s", sql)
-                        cur.execute(sql, values)
-                        if commit_every and i % commit_every == 0:
-                            conn.commit()
-                            self.log.info("Loaded %s rows into %s so far", i, table)
-                        nb_rows += 1
-                    conn.commit()
-        self.log.info("Done loading. Loaded a total of %s rows into %s", nb_rows, table)
-
-    @classmethod
-    def _serialize_cells(cls, row, conn=None):
-        return tuple(cls._serialize_cell(cell, conn) for cell in row)
-
-    @staticmethod
-    def _serialize_cell(cell, conn=None) -> str | None:
-        """
-        Return the SQL literal of the cell as a string.
-
-        :param cell: The cell to insert into the table
-        :param conn: The database connection
-        :return: The serialized cell
-        """
-        if cell is None:
-            return None
-        if isinstance(cell, datetime):
-            return cell.isoformat()
-        return str(cell)
-
-    def bulk_dump(self, table, tmp_file):
-        """
-        Dump a database table into a tab-delimited file.
-
-        :param table: The name of the source table
-        :param tmp_file: The path of the target file
-        """
-        raise NotImplementedError()
-
-    def bulk_load(self, table, tmp_file):
-        """
-        Load a tab-delimited file into a database table.
-
-        :param table: The name of the target table
-        :param tmp_file: The path of the file to load into the table
-        """
-        raise NotImplementedError()
-
-    def test_connection(self):
-        """Tests the connection using db-specific query."""
-        status, message = False, ""
-        try:
-            if self.get_first(self._test_connection_sql):
-                status = True
-                message = "Connection successfully tested"
-        except Exception as e:
-            status = False
-            message = str(e)
-
-        return status, message
-
-    def get_openlineage_database_info(self, connection) -> DatabaseInfo | None:
-        """
-        Return database specific information needed to generate and parse lineage metadata.
-
-        This includes information helpful for constructing information schema query
-        and creating correct namespace.
-
-        :param connection: Airflow connection to reduce calls of `get_connection` method
-        """
-
-    def get_openlineage_database_dialect(self, connection) -> str:
-        """
-        Return database dialect used for SQL parsing.
-
-        For a list of supported dialects check: https://openlineage.io/docs/development/sql#sql-dialects
-        """
-        return "generic"
-
-    def get_openlineage_default_schema(self) -> str | None:
-        """
-        Return default schema specific to database.
-
-        .. seealso::
-            - :class:`airflow.providers.openlineage.sqlparser.SQLParser`
-        """
-        return self.__schema or "public"
-
-    def get_openlineage_database_specific_lineage(self, task_instance) -> OperatorLineage | None:
-        """
-        Return additional database specific lineage, e.g. query execution information.
-
-        This method is called only on completion of the task.
-
-        :param task_instance: this may be used to retrieve additional information
-            that is collected during runtime of the task
-        """
-
-    @staticmethod
-    def get_openlineage_authority_part(connection, default_port: int | None = None) -> str:
-        """
-        Get authority part from Airflow Connection.
-
-        The authority represents the hostname and port of the connection
-        and conforms OpenLineage naming convention for a number of databases (e.g. MySQL, Postgres, Trino).
-
-        :param default_port: (optional) used if no port parsed from connection URI
-        """
-        parsed = urlparse(connection.get_uri())
-        port = parsed.port or default_port
-        if port:
-            authority = f"{parsed.hostname}:{port}"
-        else:
-            authority = parsed.hostname
-        return authority
-
-    def get_db_log_messages(self, conn) -> None:
-        """
-        Log all database messages sent to the client during the session.
-
-        :param conn: Connection object
-        """

@@ -17,92 +17,140 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
-from airflow.providers.snowflake.hooks.snowflake_sql_api import SnowflakeSqlApiHook
+import aiohttp
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
 if TYPE_CHECKING:
     from datetime import timedelta
 
 
-class SnowflakeSqlApiTrigger(BaseTrigger):
+class CustomSnowflakeSqlApiTrigger(BaseTrigger):
     """
-    Fetch the status for the query ids passed.
-
-    :param poll_interval:  polling period in seconds to check for the status
-    :param query_ids: List of Query ids to run and poll for the status
-    :param snowflake_conn_id: Reference to Snowflake connection id
-    :param token_life_time: lifetime of the JWT Token in timedelta
-    :param token_renewal_delta: Renewal time of the JWT Token in timedelta
+    Custom Trigger for the SnowflakeSqlApiOperator.
+    This trigger uses pre-calculated authentication headers and API URL,
+    avoiding synchronous connection fetching/header generation in the Triggerer process.
     """
 
     def __init__(
         self,
         poll_interval: float,
         query_ids: list[str],
-        snowflake_conn_id: str,
-        token_life_time: timedelta,
-        token_renewal_delta: timedelta,
+        api_url: str,
+        auth_headers: dict[str, str],
+        snowflake_conn_id: str = "snowflake_default",
     ):
         super().__init__()
         self.poll_interval = poll_interval
         self.query_ids = query_ids
+        self.api_url = api_url  # Pre-calculated base URL (e.g., https://<account>.snowflakecomputing.com)
+        self.auth_headers = auth_headers  # Pre-calculated Authorization header
         self.snowflake_conn_id = snowflake_conn_id
-        self.token_life_time = token_life_time
-        self.token_renewal_delta = token_renewal_delta
 
     def serialize(self) -> tuple[str, dict[str, Any]]:
-        """Serialize SnowflakeSqlApiTrigger arguments and classpath."""
+        """Serialize CustomSnowflakeSqlApiTrigger arguments and classpath."""
         return (
-            "airflow.providers.snowflake.triggers.snowflake_trigger.SnowflakeSqlApiTrigger",
+            "airflow.providers.snowflake.triggers.snowflake_trigger.CustomSnowflakeSqlApiTrigger",
             {
                 "poll_interval": self.poll_interval,
                 "query_ids": self.query_ids,
+                "api_url": self.api_url,
+                "auth_headers": self.auth_headers,
                 "snowflake_conn_id": self.snowflake_conn_id,
-                "token_life_time": self.token_life_time,
-                "token_renewal_delta": self.token_renewal_delta,
             },
         )
 
+    async def _process_response(self, status_code: int, resp: dict[str, Any]) -> dict[str, Any]:
+        """
+        Processes the API response synchronously with the Hook's logic.
+        Copied from Hook to make Trigger fully self-contained.
+        """
+        self.log.info("Snowflake SQL GET statements status API response: %s", resp)
+        if status_code == 202:
+            return {"status": "running", "message": "Query statements are still running"}
+        if status_code == 422:
+            return {"status": "error", "message": resp["message"]}
+        if status_code == 200:
+            if resp_statement_handles := resp.get("statementHandles"):
+                statement_handles = resp_statement_handles
+            elif resp_statement_handle := resp.get("statementHandle"):
+                statement_handles = [resp_statement_handle]
+            else:
+                statement_handles = []
+            return {
+                "status": "success",
+                "message": resp["message"],
+                "statement_handles": statement_handles,
+            }
+        # Catch-all for unexpected status codes
+        return {"status": "error", "message": resp.get("message", f"Unexpected status code {status_code}")}
+
+    async def _get_query_status(self, query_id: str) -> dict[str, Any]:
+        """Async method to check query status using pre-calculated auth."""
+
+        # The full status URL includes the API path: /api/v2/statements/
+        status_url = f"{self.api_url}/api/v2/statements/{query_id}"
+        req_id = uuid.uuid4()
+        params = {"requestId": str(req_id)}
+
+        self.log.info("Checking status for query ID %s at %s", query_id, status_url)
+
+        # Use aiohttp directly with the provided headers
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(status_url, params=params, headers=self.auth_headers) as response:
+                    status_code = response.status
+                    try:
+                        resp = await response.json()
+                    except aiohttp.ContentTypeError:
+                        self.log.error("API response was not valid JSON (Status: %s)", status_code)
+                        resp = {"message": "Non-JSON response received from Snowflake API."}
+
+                    return await self._process_response(status_code, resp)
+            except Exception as e:
+                self.log.error("API call failed for query %s: %s", query_id, e)
+                return {"status": "error", "message": f"API request failed: {e}"}
+
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Wait for the query the snowflake query to complete."""
-        SnowflakeSqlApiHook(
-            self.snowflake_conn_id,
-            self.token_life_time,
-            self.token_renewal_delta,
-        )
+
         try:
-            statement_query_ids: list[str] = []
-            for query_id in self.query_ids:
-                while True:
-                    statement_status = await self.get_query_status(query_id)
-                    if statement_status["status"] not in ["running"]:
-                        break
-                    await asyncio.sleep(self.poll_interval)
-                if statement_status["status"] == "error":
-                    yield TriggerEvent(statement_status)
+            successful_query_ids: list[str] = []
+            queries_to_poll = list(self.query_ids)
+
+            while queries_to_poll:
+                next_queries_to_poll: list[str] = []
+
+                # Check status for all running queries in parallel
+                tasks = [self._get_query_status(query_id) for query_id in queries_to_poll]
+                statuses = await asyncio.gather(*tasks)
+
+                for query_id, status in zip(queries_to_poll, statuses):
+                    if status["status"] == "success":
+                        successful_query_ids.append(query_id)
+                    elif status["status"] == "error":
+                        yield TriggerEvent(status)
+                        return
+                    else:  # status is "running" or unknown (keep polling)
+                        next_queries_to_poll.append(query_id)
+
+                queries_to_poll = next_queries_to_poll
+
+                if not queries_to_poll:
+                    yield TriggerEvent(
+                        {
+                            "status": "success",
+                            "statement_query_ids": successful_query_ids,
+                        }
+                    )
                     return
-                if statement_status["status"] == "success":
-                    statement_query_ids.extend(statement_status["statement_handles"])
-            yield TriggerEvent(
-                {
-                    "status": "success",
-                    "statement_query_ids": statement_query_ids,
-                }
-            )
+
+                await asyncio.sleep(self.poll_interval)
+
         except Exception as e:
+            self.log.exception("Exception occurred while polling Snowflake SQL API.")
             yield TriggerEvent({"status": "error", "message": str(e)})
 
-    async def get_query_status(self, query_id: str) -> dict[str, Any]:
-        """Return True if the SQL query is still running otherwise return False."""
-        hook = SnowflakeSqlApiHook(
-            self.snowflake_conn_id,
-            self.token_life_time,
-            self.token_renewal_delta,
-        )
-        return await hook.get_sql_api_query_status_async(query_id)
-
-    def _set_context(self, context):
-        pass

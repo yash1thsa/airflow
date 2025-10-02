@@ -1,4 +1,3 @@
-#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -150,6 +149,7 @@ class SnowflakeHook(DbApiHook):
         }
 
     def __init__(self, *args, **kwargs) -> None:
+        self.log.debug("DEBUG: SnowflakeHook __init__ started.")
         super().__init__(*args, **kwargs)
         self.account = kwargs.pop("account", None)
         self.warehouse = kwargs.pop("warehouse", None)
@@ -162,6 +162,7 @@ class SnowflakeHook(DbApiHook):
         self.client_request_mfa_token = kwargs.pop("client_request_mfa_token", None)
         self.client_store_temporary_credential = kwargs.pop("client_store_temporary_credential", None)
         self.query_ids: list[str] = []
+        self.log.debug("DEBUG: SnowflakeHook __init__ finished.")
 
     def _get_field(self, extra_dict, field_name):
         backcompat_prefix = "extra__snowflake__"
@@ -192,6 +193,7 @@ class SnowflakeHook(DbApiHook):
 
         This is used in ``get_uri()`` and ``get_connection()``.
         """
+        self.log.debug("DEBUG: Accessing _get_conn_params (synchronous lookup START).")
         conn = self.get_connection(self.snowflake_conn_id)  # type: ignore[attr-defined]
         extra_dict = conn.extra_dejson
         account = self._get_field(extra_dict, "account") or ""
@@ -304,7 +306,8 @@ class SnowflakeHook(DbApiHook):
         ocsp_fail_open = extra_dict.get("ocsp_fail_open")
         if ocsp_fail_open is not None:
             conn_config["ocsp_fail_open"] = _try_to_boolean(ocsp_fail_open)
-
+        
+        self.log.debug("DEBUG: _get_conn_params lookup END, returning config.")
         return conn_config
 
     def get_uri(self) -> str:
@@ -588,7 +591,7 @@ class SnowflakeHook(DbApiHook):
 
         self.log.info("Multiple query_ids found. Separate OpenLineage event will be emitted for each query.")
         try:
-            from airflow.providers.openlineage.utils.utils import should_use_external_connection
+            from airflow.providers.common.compat.openlineage.utils import should_use_external_connection
 
             use_external_connection = should_use_external_connection(self)
         except ImportError:
@@ -603,3 +606,4 @@ class SnowflakeHook(DbApiHook):
         )
 
         return None
+
